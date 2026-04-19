@@ -1,0 +1,18 @@
+column_name,description
+trx_date,วันที่ทำธุรกรรม
+trx_no,หมายเลขธุรกรรม
+member_code,รหัสสมาชิกของลูกค้า
+branch_code,รหัสสาขา
+branch_region,ภูมิภาคที่สาขาตั้งอยู่
+branch_province,จังหวัดที่สาขาตั้งอยู่
+product_code,รหัสสินค้า
+product_category,หมวดหมู่หลักของสินค้า
+product_group,กลุ่มของสินค้า
+product_type,ประเภทของสินค้า
+order_qty,จำนวนชิ้น/หน่วย ที่ลูกค้าสั่งซื้อ
+unit_price,ราคาขายของสินค้าต่อ 1 หน่วย
+cost,ต้นทุนของสินค้าต่อ 1 หน่วย
+item_discount,ส่วนลดเฉพาะรายการสินค้านั้นๆ
+customer_discount,ส่วนลดจากสิทธิของลูกค้า
+net_amount,ยอดขายสุทธิของรายการนั้น
+cost_amount,ต้นทุนรวมของรายการนั้น
