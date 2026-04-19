@@ -4,6 +4,7 @@ import sqlite3
 from google import genai
 from google.genai import types
 import json
+import time
 
 # =========================
 # CONFIG
@@ -37,6 +38,41 @@ data_dict_text = """
 # =========================
 # HELPER FUNCTIONS
 # =========================
+def detect_language(text: str) -> str:
+    """Detect main language from user question. Returns 'th' or 'en'."""
+    thai_chars = sum("\u0E00" <= ch <= "\u0E7F" for ch in text)
+    english_chars = sum(("a" <= ch.lower() <= "z") for ch in text)
+
+    if thai_chars > english_chars:
+        return "th"
+    return "en"
+
+
+def get_localized_message(key: str, language: str) -> str:
+    """Return system/fallback messages in the same language as user question."""
+    messages = {
+        "th": {
+            "sql_error": "ขออภัย ไม่สามารถสร้างคำสั่ง SQL ได้",
+            "no_data": "ไม่พบข้อมูลที่ตรงกับคำถาม",
+            "quota_error": "ขออภัย ขณะนี้ Gemini API เกินโควต้าชั่วคราว กรุณาลองใหม่อีกครั้งในอีกสักครู่",
+            "processing": "กำลังหาคำตอบ...",
+            "chat_placeholder": "พิมพ์คำถามที่นี่...",
+            "db_error_prefix": "เกิดข้อผิดพลาดจากฐานข้อมูล",
+            "ai_error_prefix": "เกิดข้อผิดพลาดจาก AI",
+        },
+        "en": {
+            "sql_error": "Sorry, I could not generate the SQL query.",
+            "no_data": "No data matched your question.",
+            "quota_error": "Sorry, the Gemini API quota has been temporarily exceeded. Please try again shortly.",
+            "processing": "Finding the answer...",
+            "chat_placeholder": "Type your question here...",
+            "db_error_prefix": "Database error",
+            "ai_error_prefix": "AI error",
+        }
+    }
+    return messages.get(language, messages["en"]).get(key, key)
+
+
 def query_to_dataframe(sql_query: str, database_name: str):
     """Run SQL query and return result as DataFrame."""
     connection = None
@@ -51,21 +87,36 @@ def query_to_dataframe(sql_query: str, database_name: str):
             connection.close()
 
 
-def generate_gemini_answer(prompt: str, is_json: bool = False) -> str:
-    """Call Gemini API and return text response."""
-    try:
-        config = types.GenerateContentConfig(
-            response_mime_type="application/json" if is_json else "text/plain"
-        )
+def generate_gemini_answer(prompt: str, is_json: bool = False, language: str = "en") -> str:
+    """Call Gemini API and return text response with simple retry for quota issues."""
+    config = types.GenerateContentConfig(
+        response_mime_type="application/json" if is_json else "text/plain"
+    )
 
-        response = gmn_client.models.generate_content(
-            model="gemini-2.5-flash-lite",
-            contents=prompt,
-            config=config
-        )
-        return response.text
-    except Exception as e:
-        return f"AI Error: {e}"
+    max_retries = 3
+    wait_seconds = 15
+
+    for attempt in range(max_retries):
+        try:
+            response = gmn_client.models.generate_content(
+                model="gemini-2.5-flash-lite",
+                contents=prompt,
+                config=config
+            )
+            return response.text
+
+        except Exception as e:
+            error_text = str(e)
+
+            if "429" in error_text or "RESOURCE_EXHAUSTED" in error_text:
+                if attempt < max_retries - 1:
+                    time.sleep(wait_seconds)
+                    continue
+                return get_localized_message("quota_error", language)
+
+            return f"{get_localized_message('ai_error_prefix', language)}: {e}"
+
+    return get_localized_message("quota_error", language)
 
 
 # =========================
@@ -73,61 +124,79 @@ def generate_gemini_answer(prompt: str, is_json: bool = False) -> str:
 # =========================
 script_prompt = """
 ### Goal
-สร้าง SQLite script ที่สั้นและถูกต้องที่สุด เพื่อตอบคำถามจากข้อมูลที่มี โดยส่งออกเป็น JSON เท่านั้น
+Create the shortest and most correct SQLite script to answer the user's question from the available data.
+Return JSON only.
 
 ### Context
-คุณคือ SQLite Master ที่ทำงานในระบบอัตโนมัติ (Strict JSON API) ห้ามตอบเป็นคำพูด ให้ตอบเฉพาะโค้ดที่ใช้งานได้จริง
+You are an SQLite Master working inside an automated system (Strict JSON API).
+Do not answer with explanations.
+Return only executable SQL wrapped in JSON.
 
 ### Input
-- คำถามที่ผู้ใช้ต้องการคำตอบ: <Question> {question} </Question>
-- ชื่อ Table ที่ต้องใช้ดึงข้อมูล: <Table_Name> {table_name} </Table_Name>
-- คำอธิบายคอลัมน์: <Schema>
+- User question: <Question> {question} </Question>
+- Table name: <Table_Name> {table_name} </Table_Name>
+- Column schema: <Schema>
 {data_dict}
 </Schema>
 
 ### Process
-1. วิเคราะห์ Query จาก <Question> และ <Schema>
-2. หากมีคอลัมน์วันที่ ให้ใช้ฟังก์ชัน `date()` หรือ `strftime()` ของ SQLite จัดการเสมอ
-3. เขียน SQL ให้กระชับและมุ่งเน้นเฉพาะคำตอบที่ต้องการ
+1. Analyze the query from <Question> and <Schema>
+2. If any date column is involved, always use SQLite date functions such as `date()` or `strftime()`
+3. Write concise SQL focused only on the requested answer
+4. Do not guess the result; generate only the SQL needed to retrieve the answer from the real database
 
 ### Output
-ตอบกลับเป็น JSON object รูปแบบเดียวเท่านั้น:
+Return exactly one JSON object in this format only:
 {{"script": "SELECT ... FROM ..."}}
 
-(ห้ามมีคำอธิบายประกอบ หรือ Markdown นอกเหนือจาก JSON)
+Do not return markdown.
+Do not return explanation text.
 """
 
 answer_prompt = """
 ### Goal
-สรุปผลลัพธ์จากข้อมูลและตอบคำถามอย่างถูกต้อง แม่นยำ และเป็นธรรมชาติ
+Summarize the result from the data and answer the user's question accurately, concisely, and naturally.
 
 ### Context
-คุณคือ Data Analyst ที่ทำหน้าที่สรุปผลจาก DataFrame และตอบคำถามผู้ใช้แบบเจาะจง ห้ามตอบยาวเกินความจำเป็น และเน้นการวิเคราะห์เชิงตัวเลขที่ถูกต้อง
-**ภาษาของคำตอบต้องตรงกับภาษาของคำถามเสมอ**
+You are a Data Analyst summarizing a DataFrame result for the user.
+Keep the answer short and precise.
+Focus on correct numeric interpretation.
 
 ### Input
-- คำถามที่ผู้ใช้ต้องการคำตอบ: <Question> {question} </Question>
-- ข้อมูลจาก DataFrame: <Raw_Data>
+- User question: <Question> {question} </Question>
+- Response language: <Language> {language} </Language>
+- Data from DataFrame: <Raw_Data>
 {raw_data}
 </Raw_Data>
 
+### Language Rule
+1. You must answer only in the language specified in <Language>
+2. If <Language> is "th", answer in Thai only
+3. If <Language> is "en", answer in English only
+4. Do not mix languages unless a column name, proper noun, code, or raw value must remain unchanged
+5. If the user question is mixed-language, follow the main language indicated by <Language>
+
 ### Process
-1. วิเคราะห์ข้อมูลจาก <Raw_Data> ให้สอดคล้องกับ <Question>
-2. คำนวณและสรุปข้อมูลเชิงสถิติที่สำคัญ
-3. จัดรูปแบบตัวเลข: ใส่คอมม่า (,) คั่นหลักพัน และทศนิยมไม่เกิน 2 ตำแหน่ง
-4. ระบุหน่วย (เช่น บาท, คน, ครั้ง, %) ต่อท้ายตัวเลขทุกครั้งตามบริบทของข้อมูล
+1. Analyze <Raw_Data> so it answers <Question>
+2. Summarize only the most relevant result
+3. Format numbers with comma separators for thousands
+4. Use no more than 2 decimal places when needed
+5. Add a suitable unit when the context clearly implies one
+6. If there is only one value, answer directly without unnecessary explanation
 
 ### Output
-ตอบเป็นข้อความสั้นๆ โดยมีโครงสร้างดังนี้:
-1. คำเกริ่นนำ: ใช้ประโยคสั้นๆ เข้าประเด็นทันที (เช่น "จากข้อมูลพบว่า...", "สรุปยอดรวมคือ...")
-2. เนื้อหา: ระบุผลการวิเคราะห์พร้อมตัวเลขที่ใส่คอมม่าและมีหน่วยลงท้ายเสมอ
-**สำคัญ: ข้อความทั้งหมดในส่วน Output ต้องเป็นภาษาเดียวกับภาษาของคำถามเท่านั้น**
+Return only the final answer text.
+Do not return markdown.
+Do not return bullet points.
+Do not return bilingual text.
 """
 
 # =========================
 # CORE LOGIC
 # =========================
 def generate_summary_answer(user_question: str) -> str:
+    language = detect_language(user_question)
+
     # 1) Generate SQL from user question
     script_prompt_input = script_prompt.format(
         question=user_question,
@@ -135,35 +204,48 @@ def generate_summary_answer(user_question: str) -> str:
         data_dict=data_dict_text
     )
 
-    sql_json_text = generate_gemini_answer(script_prompt_input, is_json=True)
+    sql_json_text = generate_gemini_answer(
+        script_prompt_input,
+        is_json=True,
+        language=language
+    )
 
-    if sql_json_text.startswith("AI Error:"):
+    if sql_json_text.startswith("AI Error:") or sql_json_text.startswith("เกิดข้อผิดพลาดจาก AI"):
+        return sql_json_text
+
+    if sql_json_text == get_localized_message("quota_error", language):
         return sql_json_text
 
     try:
         sql_script = json.loads(sql_json_text)["script"]
     except Exception:
-        return f"ขออภัย ไม่สามารถสร้างคำสั่ง SQL ได้\n\nผลลัพธ์ที่ได้:\n{sql_json_text}"
+        if language == "th":
+            return f"{get_localized_message('sql_error', language)}\n\nผลลัพธ์ที่ได้:\n{sql_json_text}"
+        return f"{get_localized_message('sql_error', language)}\n\nReturned result:\n{sql_json_text}"
 
     # 2) Query database
     df_result = query_to_dataframe(sql_script, db_name)
 
     if isinstance(df_result, str):
-        return df_result
+        if language == "th":
+            return f"{get_localized_message('db_error_prefix', language)}: {df_result}"
+        return f"{get_localized_message('db_error_prefix', language)}: {df_result}"
 
     if df_result.empty:
-        return "ไม่พบข้อมูลที่ตรงกับคำถาม"
+        return get_localized_message("no_data", language)
 
     # 3) Generate natural language answer
     answer_prompt_input = answer_prompt.format(
         question=user_question,
+        language=language,
         raw_data=df_result.to_string(index=False)
     )
 
-    final_answer = generate_gemini_answer(answer_prompt_input, is_json=False)
-
-    if final_answer.startswith("AI Error:"):
-        return final_answer
+    final_answer = generate_gemini_answer(
+        answer_prompt_input,
+        is_json=False,
+        language=language
+    )
 
     return final_answer
 
@@ -186,7 +268,13 @@ for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-if prompt := st.chat_input("พิมพ์คำถามที่นี่..."):
+ui_language = detect_language("".join(
+    [m["content"] for m in st.session_state.messages if m["role"] == "user"][-3:]
+)) if st.session_state.messages else "th"
+
+if prompt := st.chat_input(get_localized_message("chat_placeholder", ui_language)):
+    user_language = detect_language(prompt)
+
     st.session_state.messages.append({
         "role": "user",
         "content": prompt
@@ -196,7 +284,7 @@ if prompt := st.chat_input("พิมพ์คำถามที่นี่..."
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        with st.spinner("กำลังหาคำตอบ..."):
+        with st.spinner(get_localized_message("processing", user_language)):
             response = generate_summary_answer(prompt)
             st.markdown(response)
 
